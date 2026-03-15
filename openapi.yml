@@ -1,0 +1,534 @@
+openapi: 3.0.3
+
+info:
+  title: Time Deposit API
+  version: 1.0.0
+  description: |
+    RESTful API for managing time deposit balances and retrieving deposit information.
+
+    This API is implemented with a **hexagonal architecture** and exposed via two environments:
+
+    | Environment | Base URL | Auth |
+    |---|---|---|
+    | **Local (Express)** | `http://localhost:3000` | None |
+    | **AWS (API Gateway)** | `https://{api-id}.execute-api.{region}.amazonaws.com/{stage}` | `x-api-key` header |
+
+    The AWS deployment uses AWS API Gateway + Lambda (ARM64, Node 20) backed by DynamoDB.
+    The local server uses in-memory repositories seeded with sample data.
+
+    ### API Key (AWS only)
+    All AWS endpoints require an `x-api-key` header. Retrieve your key value with:
+    ```
+    aws apigateway get-api-key --api-key <KeyId> --include-value
+    ```
+
+    ### Rate Limits (AWS only)
+    - Sustained rate: **100 req/sec**
+    - Burst limit: **50 req/sec**
+    - Monthly quota: **10,000 requests**
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server (Express, in-memory repositories, no auth required)
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/{stage}
+    description: AWS API Gateway (Lambda + DynamoDB, x-api-key required)
+    variables:
+      apiId:
+        description: API Gateway REST API ID (from CloudFormation output `TimeDepositApiUrl`)
+        default: your-api-id
+      region:
+        description: AWS region where the stack is deployed
+        default: eu-west-1
+        enum:
+          - us-east-1
+          - us-west-2
+          - eu-west-1
+          - eu-central-1
+          - ap-southeast-1
+      stage:
+        description: Deployment stage
+        default: dev
+        enum:
+          - dev
+          - staging
+          - prod
+
+security:
+  - {}             # default: no auth (local server)
+  - ApiKeyAuth: [] # AWS: opt-in per operation (see each endpoint)
+
+tags:
+  - name: Time Deposits
+    description: Operations on time deposit accounts
+  - name: Health
+    description: Server liveness check (local server only)
+
+paths:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # GET /time-deposits
+  # ─────────────────────────────────────────────────────────────────────────
+  /time-deposits:
+    get:
+      operationId: getTimeDeposits
+      tags:
+        - Time Deposits
+      summary: List all time deposits
+      description: |
+        Retrieves all time deposits enriched with their associated withdrawal records.
+
+        The response includes every deposit regardless of plan type or status,
+        along with a `metadata.count` field indicating the total number returned.
+
+        **AWS note:** this endpoint requires the `x-api-key` header.
+      security:
+        - {}             # local — no auth
+        - ApiKeyAuth: [] # AWS — key required
+      responses:
+        "200":
+          description: All time deposits with their withdrawals retrieved successfully.
+          headers:
+            X-Request-Id:
+              description: Unique identifier for this request (AWS only, echoes API Gateway / Lambda request ID).
+              schema:
+                type: string
+                format: uuid
+              required: false
+            Access-Control-Allow-Origin:
+              description: CORS header (AWS only).
+              schema:
+                type: string
+                example: "*"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetTimeDepositsResponse"
+              examples:
+                success:
+                  summary: Typical response with mixed plan types
+                  value:
+                    data:
+                      - id: 1
+                        planType: basic
+                        balance: 100000
+                        days: 45
+                        withdrawals:
+                          - id: 1
+                            timeDepositId: 1
+                            amount: 500
+                            date: "2026-01-15"
+                          - id: 2
+                            timeDepositId: 1
+                            amount: 1200
+                            date: "2026-02-20"
+                      - id: 2
+                        planType: student
+                        balance: 50000
+                        days: 100
+                        withdrawals: []
+                      - id: 3
+                        planType: premium
+                        balance: 250000
+                        days: 60
+                        withdrawals:
+                          - id: 3
+                            timeDepositId: 3
+                            amount: 3000
+                            date: "2026-03-01"
+                    metadata:
+                      count: 3
+                awsSuccess:
+                  summary: AWS response (includes requestId in metadata)
+                  value:
+                    data:
+                      - id: 1
+                        planType: basic
+                        balance: 100000
+                        days: 45
+                        withdrawals: []
+                    metadata:
+                      count: 1
+                      requestId: "abc123-def456"
+        "403":
+          description: |
+            **AWS only.** Missing or invalid `x-api-key` header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayErrorResponse"
+              example:
+                message: "Forbidden"
+        "429":
+          description: |
+            **AWS only.** Rate limit or monthly quota exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayErrorResponse"
+              example:
+                message: "Too Many Requests"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                local:
+                  summary: Local server error
+                  value:
+                    message: "Internal server error"
+                aws:
+                  summary: AWS Lambda error (includes requestId)
+                  value:
+                    message: "Internal server error"
+                    requestId: "abc123-def456"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # POST /time-deposits/update-balances
+  # ─────────────────────────────────────────────────────────────────────────
+  /time-deposits/update-balances:
+    post:
+      operationId: updateBalances
+      tags:
+        - Time Deposits
+      summary: Recalculate and update all balances
+      description: |
+        Triggers a batch recalculation of interest for **all** time deposits and
+        persists the updated balances.
+
+        The interest calculation is performed by `TimeDepositCalculator` using
+        a strategy pattern based on `planType`:
+
+        | Plan | Strategy | Notes |
+        |---|---|---|
+        | `basic` | `BasicInterestStrategy` | Standard rate, grace period applies |
+        | `student` | `StudentInterestStrategy` | Reduced rate, capped at 1 year |
+        | `premium` | `PremiumInterestStrategy` | Premium rate |
+
+        This is a **fire-and-wait** operation — the response is only returned once
+        all balances have been updated. Under heavy load the AWS Lambda has a
+        60-second timeout.
+
+        **AWS note:** this endpoint requires the `x-api-key` header.
+
+        ### Request body
+        No request body is required or accepted.
+      security:
+        - {}             # local — no auth
+        - ApiKeyAuth: [] # AWS — key required
+      requestBody:
+        required: false
+        description: No body required.
+        content:
+          application/json:
+            schema:
+              type: object
+              nullable: true
+      responses:
+        "200":
+          description: All balances recalculated and persisted successfully.
+          headers:
+            X-Request-Id:
+              description: Unique identifier for this request (AWS only).
+              schema:
+                type: string
+                format: uuid
+              required: false
+            Access-Control-Allow-Origin:
+              description: CORS header (AWS only).
+              schema:
+                type: string
+                example: "*"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateBalancesResponse"
+              examples:
+                local:
+                  summary: Local server response
+                  value:
+                    message: "Balances updated successfully"
+                    metadata:
+                      updatedCount: 5
+                aws:
+                  summary: AWS Lambda response (includes requestId)
+                  value:
+                    message: "Balances updated successfully"
+                    metadata:
+                      updatedCount: 5
+                      requestId: "abc123-def456"
+                empty:
+                  summary: No deposits found — nothing to update
+                  value:
+                    message: "Balances updated successfully"
+                    metadata:
+                      updatedCount: 0
+        "403":
+          description: |
+            **AWS only.** Missing or invalid `x-api-key` header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayErrorResponse"
+              example:
+                message: "Forbidden"
+        "429":
+          description: |
+            **AWS only.** Rate limit or monthly quota exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayErrorResponse"
+              example:
+                message: "Too Many Requests"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                local:
+                  summary: Local server error
+                  value:
+                    message: "Internal server error"
+                aws:
+                  summary: AWS Lambda error (includes requestId)
+                  value:
+                    message: "Internal server error"
+                    requestId: "abc123-def456"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # GET /health  (local server only)
+  # ─────────────────────────────────────────────────────────────────────────
+  /health:
+    get:
+      operationId: healthCheck
+      tags:
+        - Health
+      summary: Health check
+      description: |
+        Returns the server liveness status and current timestamp.
+
+        > ⚠️ **Local server only.** This endpoint is not available on the AWS API Gateway deployment.
+      security:
+        - {} # no auth — health check is always public
+      responses:
+        "200":
+          description: Server is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                timestamp: "2026-03-15T10:00:00.000Z"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Components
+# ─────────────────────────────────────────────────────────────────────────────
+components:
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: |
+        API key required for all endpoints on the AWS API Gateway deployment.
+        Retrieve the key value from AWS:
+        ```
+        aws apigateway get-api-key --api-key <KeyId> --include-value
+        ```
+        The `KeyId` is available in the CloudFormation output `TimeDepositApiKeyId-{stage}`.
+
+  schemas:
+
+    # ── Domain objects ───────────────────────────────────────────────────────
+
+    Withdrawal:
+      type: object
+      description: A single withdrawal transaction against a time deposit.
+      required:
+        - id
+        - timeDepositId
+        - amount
+        - date
+      properties:
+        id:
+          type: integer
+          description: Unique identifier for the withdrawal.
+          example: 1
+        timeDepositId:
+          type: integer
+          description: Foreign key — references the parent time deposit.
+          example: 1
+        amount:
+          type: number
+          format: double
+          description: Withdrawal amount (currency units, e.g. GBP).
+          example: 500.00
+        date:
+          type: string
+          format: date
+          description: Date the withdrawal was made (ISO 8601).
+          example: "2026-01-15"
+
+    TimeDepositWithWithdrawals:
+      type: object
+      description: |
+        A time deposit account enriched with its full list of withdrawal records.
+        This is the primary response DTO returned by `GET /time-deposits`.
+      required:
+        - id
+        - planType
+        - balance
+        - days
+        - withdrawals
+      properties:
+        id:
+          type: integer
+          description: Unique identifier for the time deposit.
+          example: 1
+        planType:
+          type: string
+          description: |
+            Interest plan type. Determines which interest calculation strategy is applied.
+          enum:
+            - basic
+            - student
+            - premium
+          example: basic
+        balance:
+          type: number
+          format: double
+          description: |
+            Current balance of the time deposit (principal + accrued interest,
+            minus any withdrawals that have already been applied).
+          example: 100000.00
+        days:
+          type: integer
+          description: |
+            Number of days since the deposit was opened.
+            Used by the interest strategy to determine eligibility and rate:
+            - Grace period deposits (< ~30 days for basic) accrue no interest.
+            - Student plan deposits older than 365 days accrue no interest.
+          example: 45
+        withdrawals:
+          type: array
+          description: All withdrawal transactions associated with this deposit. Empty array if none.
+          items:
+            $ref: "#/components/schemas/Withdrawal"
+
+    # ── Response envelopes ───────────────────────────────────────────────────
+
+    GetTimeDepositsMetadata:
+      type: object
+      description: Pagination/envelope metadata for the list response.
+      required:
+        - count
+      properties:
+        count:
+          type: integer
+          description: Total number of time deposits returned.
+          example: 5
+        requestId:
+          type: string
+          description: AWS request ID (Lambda/API Gateway). Present on AWS responses only.
+          example: "abc123-def456"
+
+    GetTimeDepositsResponse:
+      type: object
+      description: Response envelope for `GET /time-deposits`.
+      required:
+        - data
+        - metadata
+      properties:
+        data:
+          type: array
+          description: Array of all time deposits with their withdrawals.
+          items:
+            $ref: "#/components/schemas/TimeDepositWithWithdrawals"
+        metadata:
+          $ref: "#/components/schemas/GetTimeDepositsMetadata"
+
+    UpdateBalancesMetadata:
+      type: object
+      description: Metadata returned after a balance update operation.
+      required:
+        - updatedCount
+      properties:
+        updatedCount:
+          type: integer
+          description: Number of time deposits whose balance was recalculated and saved.
+          example: 5
+        requestId:
+          type: string
+          description: AWS request ID (Lambda/API Gateway). Present on AWS responses only.
+          example: "abc123-def456"
+
+    UpdateBalancesResponse:
+      type: object
+      description: Response envelope for `POST /time-deposits/update-balances`.
+      required:
+        - message
+        - metadata
+      properties:
+        message:
+          type: string
+          description: Human-readable confirmation message.
+          example: "Balances updated successfully"
+        metadata:
+          $ref: "#/components/schemas/UpdateBalancesMetadata"
+
+    HealthResponse:
+      type: object
+      description: Response body for `GET /health` (local server only).
+      required:
+        - status
+        - timestamp
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+          description: Always `"ok"` when the server is healthy.
+          example: ok
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of when the health check was processed.
+          example: "2026-03-15T10:00:00.000Z"
+
+    # ── Error responses ──────────────────────────────────────────────────────
+
+    ErrorResponse:
+      type: object
+      description: |
+        Standard error response returned by the application on internal failures (HTTP 500).
+        The `requestId` field is only present on AWS responses.
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: Human-readable error description.
+          example: "Internal server error"
+        requestId:
+          type: string
+          description: AWS request ID, present on AWS responses only.
+          example: "abc123-def456"
+
+    GatewayErrorResponse:
+      type: object
+      description: |
+        Error response returned directly by AWS API Gateway (not the Lambda application code).
+        Occurs for 403 (missing/invalid API key) and 429 (throttled/quota exceeded).
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: Gateway-level error message.
+          example: "Forbidden"
